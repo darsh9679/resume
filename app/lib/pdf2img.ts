@@ -83,3 +83,30 @@ export async function convertPdfToImage(
         };
     }
 }
+
+/**
+ * Extract all text content from a PDF file using pdfjs-dist.
+ * Concatenates text from all pages.
+ */
+export async function extractPdfText(file: File): Promise<string> {
+    try {
+        const lib = await loadPdfJs();
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await lib.getDocument({ data: arrayBuffer }).promise;
+        const numPages = pdf.numPages;
+        const pageTexts: string[] = [];
+
+        for (let i = 1; i <= numPages; i++) {
+            const page = await pdf.getPage(i);
+            const textContent = await page.getTextContent();
+            const pageText = textContent.items
+                .map((item: any) => item.str)
+                .join(" ");
+            pageTexts.push(pageText);
+        }
+
+        return pageTexts.join("\n\n");
+    } catch (err) {
+        throw new Error(`Failed to extract text from PDF: ${err}`);
+    }
+}

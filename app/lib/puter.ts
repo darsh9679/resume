@@ -20,12 +20,28 @@ declare global {
                 readdir: (path: string) => Promise<FSItem[] | undefined>;
             };
             ai: {
-                chat: (
-                    prompt: string | ChatMessage[],
-                    imageURL?: string | PuterChatOptions,
-                    testMode?: boolean,
-                    options?: PuterChatOptions
-                ) => Promise<Object>;
+                chat: {
+                    (
+                        prompt: string,
+                        options?: PuterChatOptions
+                    ): Promise<Object>;
+                    (
+                        prompt: string,
+                        testMode?: boolean,
+                        options?: PuterChatOptions
+                    ): Promise<Object>;
+                    (
+                        prompt: string,
+                        imageURL?: string | File | Blob | string[],
+                        testMode?: boolean,
+                        options?: PuterChatOptions
+                    ): Promise<Object>;
+                    (
+                        prompt: ChatMessage[],
+                        testMode?: boolean,
+                        options?: PuterChatOptions
+                    ): Promise<Object>;
+                };
                 img2txt: (
                     image: string | File | Blob,
                     testMode?: boolean
@@ -73,7 +89,7 @@ interface PuterStore {
             options?: PuterChatOptions
         ) => Promise<AIResponse | undefined>;
         feedback: (
-            path: string,
+            resumeText: string,
             message: string
         ) => Promise<AIResponse | undefined>;
         img2txt: (
@@ -98,6 +114,108 @@ interface PuterStore {
 
 const getPuter = (): typeof window.puter | null =>
     typeof window !== "undefined" && window.puter ? window.puter : null;
+
+const FEEDBACK_MODELS = ["gpt-4o", "gpt-4o-mini"] as const;
+
+const getPuterErrorMessage = (error: unknown): string => {
+    if (typeof error === "object" && error !== null) {
+        if ("error" in error && typeof error.error === "string") {
+            return error.error;
+        }
+
+        // Handle nested error objects from Puter: { error: { code: "...", message: "..." } }
+        if ("error" in error && typeof error.error === "object" && error.error !== null) {
+            const nested = error.error as Record<string, unknown>;
+            if (typeof nested.message === "string") return nested.message;
+            if (typeof nested.code === "string") return nested.code;
+        }
+
+        if ("message" in error && typeof error.message === "string") {
+            return error.message;
+        }
+
+        if ("code" in error && typeof (error as Record<string, unknown>).code === "string") {
+            return (error as Record<string, string>).code;
+        }
+    }
+
+    if (error instanceof Error) {
+        return error.message;
+    }
+
+    return "Unexpected Puter AI error";
+};
+
+const hasStringProperty = (
+    value: unknown,
+    property: string
+): value is Record<string, string> =>
+    typeof value === "object" &&
+    value !== null &&
+    property in value &&
+    typeof (value as Record<string, unknown>)[property] === "string";
+
+const isRetryableModelError = (error: unknown): boolean => {
+    const message = getPuterErrorMessage(error).toLowerCase();
+    const errorStr = JSON.stringify(error).toLowerCase();
+
+    if (
+        message.includes("model not found") ||
+        message.includes("permission denied") ||
+        message.includes("usage-limited-chat") ||
+        message.includes("not found") ||
+        message.includes("404")
+    ) {
+        return true;
+    }
+
+    // Check for nested error structures from Puter (e.g. 404 from provider)
+    if (
+        errorStr.includes("not_found_error") ||
+        errorStr.includes("model_not_found") ||
+        errorStr.includes("404") ||
+        errorStr.includes("ai_chat_all_providers_failed")
+    ) {
+        return true;
+    }
+
+    if (hasStringProperty(error, "delegate") && error.delegate === "usage-limited-chat") {
+        return true;
+    }
+
+    if (
+        hasStringProperty(error, "code") &&
+        (error.code === "error_400_from_delegate" ||
+         error.code === "ai_chat_all_providers_failed")
+    ) {
+        return true;
+    }
+
+    return false;
+};
+
+const isPuterChatOptions = (value: unknown): value is PuterChatOptions =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+
+const callPuterChat = async (
+    puter: NonNullable<ReturnType<typeof getPuter>>,
+    prompt: string | ChatMessage[],
+    options?: PuterChatOptions
+) => {
+    if (Array.isArray(prompt)) {
+        if (options) {
+            return puter.ai.chat(prompt, false, options);
+        }
+
+        return puter.ai.chat(prompt);
+    }
+
+    if (options) {
+        return puter.ai.chat(prompt, options);
+    }
+
+    return puter.ai.chat(prompt);
+};
 
 export const usePuterStore = create<PuterStore>((set, get) => {
     const setError = (msg: string) => {
@@ -321,37 +439,58 @@ export const usePuterStore = create<PuterStore>((set, get) => {
             setError("Puter.js not available");
             return;
         }
-        // return puter.ai.chat(prompt, imageURL, testMode, options);
+
+        if (Array.isArray(prompt)) {
+            const resolvedOptions = isPuterChatOptions(imageURL) ? imageURL : options;
+
+            return puter.ai.chat(prompt, testMode, resolvedOptions) as Promise<
+                AIResponse | undefined
+            >;
+        }
+
+        if (isPuterChatOptions(imageURL)) {
+            return puter.ai.chat(prompt, imageURL) as Promise<AIResponse | undefined>;
+        }
+
         return puter.ai.chat(prompt, imageURL, testMode, options) as Promise<
             AIResponse | undefined
         >;
     };
 
-    const feedback = async (path: string, message: string) => {
+    const feedback = async (resumeText: string, message: string) => {
         const puter = getPuter();
         if (!puter) {
             setError("Puter.js not available");
             return;
         }
 
-        return puter.ai.chat(
-            [
-                {
-                    role: "user",
-                    content: [
-                        {
-                            type: "file",
-                            puter_path: path,
-                        },
-                        {
-                            type: "text",
-                            text: message,
-                        },
-                    ],
-                },
-            ],
-            { model: "claude-3-7-sonnet" }
-        ) as Promise<AIResponse | undefined>;
+        // Send resume text directly in the prompt instead of using puter_path
+        // (puter_path file references don't work with all AI models)
+        const fullPrompt = `${message}\n\n--- RESUME CONTENT ---\n${resumeText}\n--- END OF RESUME ---`;
+
+        let lastError: unknown;
+
+        for (const model of FEEDBACK_MODELS) {
+            try {
+                return (await callPuterChat(puter, fullPrompt, {
+                    model,
+                })) as AIResponse | undefined;
+            } catch (error) {
+                lastError = error;
+
+                if (!isRetryableModelError(error)) {
+                    throw error;
+                }
+            }
+        }
+
+        try {
+            return (await callPuterChat(puter, fullPrompt)) as AIResponse | undefined;
+        } catch (error) {
+            lastError = error;
+        }
+
+        throw new Error(getPuterErrorMessage(lastError));
     };
 
     const img2txt = async (image: string | File | Blob, testMode?: boolean) => {
@@ -438,7 +577,7 @@ export const usePuterStore = create<PuterStore>((set, get) => {
                 testMode?: boolean,
                 options?: PuterChatOptions
             ) => chat(prompt, imageURL, testMode, options),
-            feedback: (path: string, message: string) => feedback(path, message),
+            feedback: (resumeText: string, message: string) => feedback(resumeText, message),
             img2txt: (image: string | File | Blob, testMode?: boolean) =>
                 img2txt(image, testMode),
         },
